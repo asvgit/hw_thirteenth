@@ -14,6 +14,7 @@
 #include <cppconn/statement.h>
 
 using string = std::string;
+using StringVec = std::vector<string>;
 
 class MysqlDbConnect {
 	sql::Driver *driver;
@@ -36,13 +37,95 @@ public:
 		delete stmt;
 	}
 
+	string DoCmd(const StringVec &request) {
+		if (request.empty())
+			return "ERR empty request";
+		if (request.front() == "INSERT")
+			return Insert(request);
+		if (request.front() == "TRUNCATE")
+			return Truncate(request);
+		if (request.front() == "INTERSECTION")
+			return Intersection();
+		if (request.front() == "SYMMETRIC_DIFFERENCE")
+			return Difference();
+		return "ERR unknown command '" + request.front() + "'";
+	}
+
+private:
 	sql::ResultSet* Query(const string &query_str) {
 		return stmt->executeQuery(query_str);
 	}
 
-	void Insert(const string &table, const string &id, const string &name) {
-		stmt->execute("INSERT INTO " + table + " (id, name)"
-				" VALUES(" + id + ", '" + name + "')");
+	string Insert(const StringVec &request) {
+		if (request.size() < 4)
+			return "ERR not enough arguments for insertion";
+		const string &table = request[1];
+		if (table != "A" && table != "B")
+			return "ERR unknown table '" + table + "'";
+
+		const string &id = request[2];
+		const string real_table = table == "A" ? "friday_a" : "friday_b";
+		const string query_str = "SELECT *"
+				" FROM " + real_table +
+				" WHERE id = " + id;
+		if (stmt->executeQuery(query_str)->next()) {
+			return "ERR duplicate '" + id + "'";
+		}
+
+		stmt->execute("INSERT INTO " + real_table + " (id, name)"
+				" VALUES(" + id + ", '" + request[3] + "')");
+		return "OK";
+	}
+
+	string Truncate(const StringVec &request) {
+		if (request.size() < 2)
+			return "ERR not enough arguments for truncation";
+		const string &table = request[1];
+		if (table != "A" && table != "B")
+			return "ERR unknown table '" + table + "'";
+		const string real_table = table == "A" ? "friday_a" : "friday_b";
+		stmt->execute("DELETE FROM " + real_table);
+		return "OK";
+	}
+
+	string Intersection() {
+		string result;
+		const string query_str = "SELECT"
+				" a.id, a.name AS a_name, b.name AS b_name"
+			" FROM friday_a AS a"
+			" INNER JOIN friday_b AS b ON b.id = a.id";
+		auto res = stmt->executeQuery(query_str);
+		while (res->next()) {
+			result += res->getString("id")
+				+ "," + res->getString("a_name")
+				+ "," + res->getString("b_name")
+				+ "\n";
+		}
+		delete res;
+		return result + "OK";
+	}
+
+	string Difference() {
+		string result;
+		const string query_str = "SELECT"
+				" a.id, a.name AS a_name, b.name AS b_name"
+			" FROM friday_a AS a"
+			" LEFT OUTER JOIN friday_b AS b ON b.id = a.id"
+			" WHERE a.name IS NULL OR b.name IS NULL"
+			" UNION"
+			" SELECT b.id, a.name AS a_name, b.name AS b_name"
+			" FROM friday_a AS a"
+			" RIGHT OUTER JOIN friday_b AS b ON b.id = a.id"
+			" WHERE a.name IS NULL OR b.name IS NULL";
+		auto res = stmt->executeQuery(query_str);
+		while (res->next()) {
+			result += res->getString("id")
+				+ "," + res->getString("a_name")
+				+ "," + res->getString("b_name")
+				+ "\n";
+		}
+		delete res;
+		return result + "OK";
 	}
 };
 
@@ -73,18 +156,18 @@ public:
 private:
 	static void client_session(ba::ip::tcp::socket sock, QueryPtr query_ptr) {
 		try {
-			string request;
+			std::vector<string> request;
 			boost::asio::streambuf buf;
-			read_until(sock, buf, '\n');
-			std::istream(&buf) >> request;
-			query_ptr->Insert("friday_a", "0", request);
-			sql::ResultSet *res = query_ptr->Query("SELECT * from friday_a");
-			while (res->next()) {
-				std::cout << "id(" << res->getString("id")
-					<< ") :" << res->getString("name") << std::endl;
-			}
-			delete res;
-			ba::write(sock, ba::buffer("pong", 4));
+			auto len = read_until(sock, buf, '\n');
+			string l;
+			do {
+				l.clear();
+				std::istream(&buf) >> l;
+				if (!l.empty())
+					request.push_back(l);
+			} while (!l.empty());
+			const string response = query_ptr->DoCmd(request);
+			ba::write(sock, ba::buffer(response + "\n", response.size() + 1));
 		} catch (const std::exception &e) {
 			std::cerr << e.what() << std::endl;
 			throw;
@@ -101,8 +184,6 @@ int main(int argc, char *argv[]) {
 			ss >> n;
 			return n;
 		}();
-		// std::cout << "Listen: *:" << port << std::endl;
-
 		auto query_ptr = std::make_shared<MysqlDbConnect>();
 		Server server(query_ptr, port);
 		server.Start();
